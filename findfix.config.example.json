@@ -1,0 +1,35 @@
+{
+  "work": [
+    {
+      "label": "TODO/FIXME",
+      "root": ".",
+      "include": ["**/*.py"],
+      "regex": "#\\s*(TODO|FIXME|HACK|XXX)\\b",
+      "description": "Unresolved TODO/FIXME/HACK markers that represent real, actionable follow-up work. Skip markers that are just informational notes or already tracked elsewhere.",
+      "refiner": "treesitter",
+      "language": "python",
+      "context_lines": 12,
+      "max_matches": 100
+    },
+    {
+      "label": "bare-except",
+      "root": ".",
+      "include": ["**/*.py"],
+      "regex": "except\\s*:",
+      "description": "Bare `except:` clauses that swallow all exceptions including KeyboardInterrupt/SystemExit. Fix by catching a specific exception type (or `Exception` when appropriate).",
+      "refiner": "treesitter",
+      "language": "python"
+    },
+    {
+      "label": "sync-file-io",
+      "root": ".",
+      "include": ["**/*.py"],
+      "description": "Blocking, synchronous file or network I/O performed directly inside an async function without offloading to a thread — which stalls the event loop.",
+      "refiner": "line-window",
+      "language": "python",
+      "mcp": {
+        "ado": { "ado_org": "your-ado-org", "tools": ["search_code"] }
+      }
+    }
+  ]
+}

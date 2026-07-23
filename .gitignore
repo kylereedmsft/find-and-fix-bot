@@ -1,0 +1,17 @@
+SampleHarness/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local work config (copy from findfix.config.example.json)
+findfix.config.json
+# Environment-specific configs (may contain internal paths / org names)
+findfix.config.spo.json
+findfix.config.*.local.json
