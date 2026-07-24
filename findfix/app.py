@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Callable
 
 from .cache import ResolutionCache
+from . import ado
 from .chat import ChatSession, history_path
 from .config import WorkConfig
 from .investigator import Investigator
@@ -109,6 +110,43 @@ class FindFixApp:
             self._status(f"apply failed: {msg}")
             self._notify()
         return ok, msg
+
+    # ---- ADO work-item tracking -----------------------------------------
+
+    def create_work_item(self, key: str) -> tuple[bool, str]:
+        """File one ADO work item for the selected match's file.
+
+        Idempotent: if the item already carries a `work_item_id` this is a
+        no-op that just reports the existing id. Requires `ado_tracking` on the
+        work unit. Returns (ok, message). On success the id/url are persisted.
+        """
+        a = self.state.items.get(key)
+        if a is None:
+            return False, "no such item"
+        if a.resolution.is_tracked:
+            wid = a.resolution.work_item_id
+            self._status(f"already tracked as #{wid}")
+            self._notify()
+            return True, f"already tracked as #{wid}"
+        tracking = self.work.ado_tracking
+        if tracking is None:
+            return False, "ADO tracking not configured for this work unit"
+
+        title = ado.build_title(tracking, self.work.label, a)
+        description = ado.build_description(self.work.label, a)
+        self._status(f"filing work item for {a.match.path}…")
+        self._notify()
+        res = ado.create_work_item(tracking, title, description)
+        if res.ok and res.work_item_id is not None:
+            a.resolution.work_item_id = res.work_item_id
+            a.resolution.work_item_url = res.url
+            self._cache.put(a)
+            self._status(f"filed work item #{res.work_item_id} for {a.match.path}")
+            self._notify()
+            return True, res.message
+        self._status(f"work item failed: {res.message}")
+        self._notify()
+        return False, res.message
 
     # ---- interactive discussion -----------------------------------------
 

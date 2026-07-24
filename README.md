@@ -29,7 +29,7 @@ from the `SampleHarness/pr_sentry` exemplar.
 │   @@ ...                                                                    │
 │  Press 'a' to apply this fix.                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
- ← Prev  → Next  SPACE Start/pause  a Apply fix  e Re-eval  d Discuss  r Refresh  o Open  q Quit
+ ← Prev  → Next  SPACE Start/pause  a Apply fix  e Re-eval  d Discuss  w Work item  r Refresh  o Open  q Quit
 ```
 
 ## The funnel
@@ -62,8 +62,9 @@ pass that finds occurrences *and* proposes fixes in one shot.
 | **Config** | `config.py` | `WorkConfig` + JSON loader. Each entry = one tab; derives scan scope, refiner, cache scope, MCP surface. | ❌ |
 | **Data** | `scanner.py` | Regex/text scan → `Match[]`; pluggable refiner for the focus span. | ❌ Deterministic |
 | **AI** | `investigator.py` + `skills/find-and-fix/` | Copilot session, read-only perms, granted code-search MCP tools. Confirms the match and emits a unified diff. | ✅ Judgment only |
-| **Orchestration** | `app.py` + `cache.py` | Per-unit worker: scan → seed → investigate one-at-a-time; cache by content hash; `apply_fix` via `git apply`. | ❌ |
-| **Presentation** | `tui.py` | Textual: tab per unit, match table, explanation + diff detail, `a` to apply. | ❌ |
+| **Orchestration** | `app.py` + `cache.py` | Per-unit worker: scan → seed → investigate one-at-a-time; cache by content hash; `apply_fix` via `git apply`; `create_work_item` via `az`. | ❌ |
+| **Tracking** | `ado.py` | Harness-owned ADO work-item creation (one per file) via the `az` CLI — deterministic, no LLM. | ❌ |
+| **Presentation** | `tui.py` | Textual: tab per unit, match table, explanation + diff detail, `a` to apply, `w` to file a work item. | ❌ |
 
 ## Configure work (JSON)
 
@@ -100,6 +101,7 @@ A unit can be regex-only, description-only, or both.
 | `refiner` | `line-window` \| `treesitter` \| `roslyn`. |
 | `context_lines` / `language` | Window size / grammar hint for the refiner. |
 | `mcp` | Read-only MCP servers granted to the investigator. `{"name": {"ado_org": "org", "tools": [...]}}` expands to the Azure DevOps server; a full stdio spec is passed through verbatim. |
+| `ado_tracking` | Optional. Enables the `w` key to file **one ADO work item per file** for a match. `{"org", "project"}` required; optional `type` (default `Task`), `area_path`, `iteration_path`, `parent`, `tags[]`, `title_template` (`{label}`/`{path}`/`{line}`). Uses the `az` CLI — run `az login` + `az extension add --name azure-devops`. |
 | `skill` | Optional skill dir under `skills/`. |
 | `max_matches` | Cap on deterministic hits per cycle. |
 
@@ -184,6 +186,33 @@ are saved to the resolution cache. Nothing is regenerated from scratch on
 restart: prior resolutions and conversations are restored, and a re-scan won't
 clobber a fix you refined.
 
+## Track work in Azure DevOps (`w`)
+
+Add an `ado_tracking` block to a work unit and press **`w`** on a match to file
+**one ADO work item per file** (covering every occurrence in that file). It's a
+manual, deterministic action — no LLM — that shells out to the `az` CLI, reusing
+the same `azcli` auth the ADO search MCP uses:
+
+```json
+"ado_tracking": {
+  "org": "onedrive",
+  "project": "SPO",
+  "type": "Task",
+  "area_path": "SPO\\AmbientContext",
+  "iteration_path": "SPO\\Backlog",
+  "parent": 123456,
+  "tags": ["find-and-fix-bot", "SPThreadContext"],
+  "title_template": "[{label}] {path}"
+}
+```
+
+Only `org` and `project` are required. The work item's description carries the
+explanation, the occurrence lines, and the proposed diff. Once filed, the item
+shows a `⧉#<id>` badge in the table + detail; the id is persisted in the cache,
+so `w` is idempotent (a second press just opens the existing item in a browser).
+Prereqs: `az login` and `az extension add --name azure-devops`. If `az` is
+missing or logged out, the TUI surfaces a clear message instead of crashing.
+
 ## State & persistence
 
 Everything expensive is cached on disk under `%LOCALAPPDATA%\find-and-fix-bot\`
@@ -250,6 +279,7 @@ judgment call, and that seam is mocked.
 | `tests/test_cache_models.py` | cache round-trip / prune / scoping, verdict ordering, `has_fix` |
 | `tests/test_app.py` | seed→investigate flow, cache reuse, pause behavior, `git apply` (success, `--recount`, non-applicable), force re-evaluate (cache-ignoring, works while paused), file-change staleness, `file_sig` persistence |
 | `tests/test_chat.py` | per-unit `context` (scope key + prompt injection), discuss transcript persistence/restore, one-time context preload, revised-fix parsing → resolution update |
+| `tests/test_ado.py` | `ado_tracking` config parsing, title/description builders, `az` create flow (id parse, missing az, logged-out), work-item id round-trip, `w` idempotency, unconfigured-unit error |
 
 Each test runs against an isolated cache dir (`tests/conftest.py`), so your
 real `%LOCALAPPDATA%` store is never touched.

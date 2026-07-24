@@ -29,6 +29,17 @@
       "language": "python",
       "mcp": {
         "ado": { "ado_org": "your-ado-org", "tools": ["search_code"] }
+      },
+      "//ado_tracking": "Optional. When present, press `w` on a match to file ONE Azure DevOps work item per file (covering all occurrences) via the `az` CLI. Requires `az login` + the azure-devops extension. Only 'org' and 'project' are required.",
+      "ado_tracking": {
+        "org": "your-ado-org",
+        "project": "YourProject",
+        "type": "Task",
+        "area_path": "YourProject\\Area",
+        "iteration_path": "YourProject\\Sprint 1",
+        "parent": 123456,
+        "tags": ["find-and-fix-bot", "tech-debt"],
+        "title_template": "[{label}] {path}"
       }
     }
   ]

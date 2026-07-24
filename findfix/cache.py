@@ -8,7 +8,9 @@ for matches whose surrounding code hasn't changed (the key embeds a content
 hash of the focus span).
 
 We do NOT persist the (re-derivable) `focus_code`; cached entries carry the
-match metadata + the resolution (verdict, explanation, diff) only.
+match metadata + the resolution (verdict, explanation, diff) only. We DO
+persist the focus span's `content_hash` so a hydrated match reproduces the
+exact key it was cached under (the key embeds that hash).
 """
 
 from __future__ import annotations
@@ -36,18 +38,25 @@ def _to_payload(a: AnalyzedMatch) -> dict:
             "snippet": m.snippet, "focus_start": m.focus_start,
             "focus_end": m.focus_end, "refiner": m.refiner, "reason": m.reason,
             "occurrences": list(m.occurrences),
+            "content_hash": m.content_hash,
         },
         "resolution": {
             "verdict": r.verdict.value, "explanation": r.explanation,
             "diff": r.diff, "confidence": r.confidence, "error": r.error,
             "file_sig": r.file_sig,
+            "work_item_id": r.work_item_id, "work_item_url": r.work_item_url,
             "resolved_at": r.resolved_at.isoformat() if r.resolved_at else None,
         },
     }
 
 
-def _from_payload(d: dict) -> AnalyzedMatch:
+def _from_payload(d: dict, key: str | None = None) -> AnalyzedMatch:
     md = d["match"]
+    # Prefer the explicitly persisted hash; fall back to the trailing hash of
+    # the cache key for entries written before content_hash was persisted.
+    stored = md.get("content_hash", "")
+    if not stored and key and key.count(":") >= 2:
+        stored = key.rsplit(":", 1)[-1]
     m = Match(
         work=md["work"], path=md["path"], abs_path=md["abs_path"],
         line=md["line"], col=md["col"], matched_text=md["matched_text"],
@@ -55,12 +64,14 @@ def _from_payload(d: dict) -> AnalyzedMatch:
         focus_end=md["focus_end"], focus_code="", refiner=md["refiner"],
         reason=md.get("reason", ""),
         occurrences=tuple(md.get("occurrences", ())),
+        stored_hash=stored,
     )
     rd = d["resolution"]
     r = Resolution(
         verdict=Verdict(rd["verdict"]), explanation=rd.get("explanation", ""),
         diff=rd.get("diff", ""), confidence=rd.get("confidence", ""),
         error=rd.get("error"), file_sig=rd.get("file_sig", ""),
+        work_item_id=rd.get("work_item_id"), work_item_url=rd.get("work_item_url", ""),
         resolved_at=datetime.fromisoformat(rd["resolved_at"]) if rd.get("resolved_at") else None,
     )
     return AnalyzedMatch(match=m, resolution=r)
@@ -98,7 +109,7 @@ class ResolutionCache:
         if raw is None:
             return None
         try:
-            return _from_payload(raw)
+            return _from_payload(raw, key)
         except Exception:  # noqa: BLE001 — corrupt entry
             return None
 

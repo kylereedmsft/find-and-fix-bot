@@ -212,7 +212,24 @@ def test_file_sig_persists_across_cache_roundtrip(tmp_path):
     assert app2.state.items[key].resolution.file_sig == app.state.items[key].resolution.file_sig
 
 
-def test_newly_excluded_items_are_dropped_from_cache_and_view(tmp_path):
+def test_hydrated_match_key_matches_dict_key(tmp_path):
+    """Regression: a match hydrated from cache must reproduce the exact key it
+    was stored under. The key embeds the focus content-hash, which the cache
+    does not re-derive (focus_code isn't persisted), so it must be persisted
+    separately and restored into `stored_hash`. Otherwise the detail pane can't
+    resolve the selected row (items.get(sel) misses)."""
+    res = Resolution(verdict=Verdict.FIX, explanation="e", diff="d")
+    app = _make_app(tmp_path, res)
+    asyncio.run(app._scan_once())
+    assert app.state.items  # sanity
+
+    app2 = FindFixApp(app.work, interval=1)  # hydrates purely from disk
+    assert app2.state.items
+    for k, a in app2.state.items.items():
+        assert a.match.key == k, f"hydrated key {a.match.key!r} != dict key {k!r}"
+
+
+
     """A folder excluded after items were cached (even APPLIED) must disappear."""
     _git_init(tmp_path)
     (tmp_path / "dlc").mkdir()

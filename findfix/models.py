@@ -64,6 +64,7 @@ class Match:
     refiner: str = "line-window"  # which refiner produced the focus span
     reason: str = ""   # for NL/discovery matches: why the model flagged it
     occurrences: tuple[int, ...] = ()  # all hit lines in this file when grouped; empty => single hit at `line`
+    stored_hash: str = ""  # persisted content hash for cache-hydrated matches (focus_code isn't persisted)
 
     @property
     def occurrence_count(self) -> int:
@@ -71,7 +72,14 @@ class Match:
 
     @property
     def content_hash(self) -> str:
-        return hashlib.sha1(self.focus_code.encode("utf-8", "replace")).hexdigest()[:12]
+        # Live matches hash their focus span; cache-hydrated matches (which
+        # intentionally don't persist focus_code) fall back to the stored hash
+        # so `key` stays identical to the key they were cached under.
+        if self.focus_code:
+            return hashlib.sha1(self.focus_code.encode("utf-8", "replace")).hexdigest()[:12]
+        if self.stored_hash:
+            return self.stored_hash
+        return hashlib.sha1(b"").hexdigest()[:12]
 
     @property
     def key(self) -> str:
@@ -94,10 +102,16 @@ class Resolution:
     error: str | None = None
     resolved_at: datetime | None = None
     file_sig: str = ""          # whole-file hash at resolution time; drives stale detection
+    work_item_id: int | None = None  # ADO work item filed for this match (per-file); None => untracked
+    work_item_url: str = ""     # browser URL of the filed work item, when known
 
     @property
     def has_fix(self) -> bool:
         return bool(self.diff.strip()) and self.verdict in (Verdict.FIX, Verdict.APPLIED)
+
+    @property
+    def is_tracked(self) -> bool:
+        return self.work_item_id is not None
 
 
 @dataclass(slots=True)

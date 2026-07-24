@@ -36,6 +36,23 @@ _ALWAYS_EXCLUDE = [
 
 
 @dataclass(slots=True, frozen=True)
+class AdoTracking:
+    """Where/how to file an Azure DevOps work item for a tracked match.
+
+    Attached per `WorkConfig`. Creation is manual (TUI `w` key) and
+    harness-owned (via the `az` CLI), one work item per file. See ado.py.
+    """
+    org: str
+    project: str
+    type: str = "Task"
+    area_path: str | None = None
+    iteration_path: str | None = None
+    parent: int | None = None
+    tags: tuple[str, ...] = ()
+    title_template: str | None = None  # e.g. "[{label}] Migrate {path}"
+
+
+@dataclass(slots=True, frozen=True)
 class WorkConfig:
     label: str
     # --- what to scan -----------------------------------------------------
@@ -59,6 +76,8 @@ class WorkConfig:
     # Copilot SDK `mcp_servers` kwarg mostly verbatim (see investigator.py).
     mcp: dict = field(default_factory=dict)
     skill: str | None = None              # optional skill dir name under skills/
+    # --- how to track (optional ADO work items) --------------------------
+    ado_tracking: AdoTracking | None = None  # None => tracking disabled for this unit
 
     # ---- derived ---------------------------------------------------------
 
@@ -102,6 +121,27 @@ def _coerce(raw: dict) -> WorkConfig:
             return "\n".join(str(x) for x in v)
         return v
 
+    def ado(key: str):
+        v = raw.get(key)
+        if not isinstance(v, dict):
+            return None
+        if "org" not in v or "project" not in v:
+            raise ValueError("ado_tracking requires 'org' and 'project'")
+        parent = v.get("parent")
+        tags = v.get("tags", ())
+        if isinstance(tags, str):
+            tags = (tags,)
+        return AdoTracking(
+            org=str(v["org"]),
+            project=str(v["project"]),
+            type=str(v.get("type", "Task")),
+            area_path=v.get("area_path"),
+            iteration_path=v.get("iteration_path"),
+            parent=int(parent) if parent is not None else None,
+            tags=tuple(str(t) for t in tags),
+            title_template=v.get("title_template"),
+        )
+
     return WorkConfig(
         label=str(raw["label"]),
         root=str(raw.get("root", ".")),
@@ -117,6 +157,7 @@ def _coerce(raw: dict) -> WorkConfig:
         language=raw.get("language"),
         mcp=dict(raw.get("mcp", {})),
         skill=raw.get("skill"),
+        ado_tracking=ado("ado_tracking"),
     )
 
 

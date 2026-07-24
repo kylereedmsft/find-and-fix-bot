@@ -12,6 +12,7 @@ directly (fix application is delegated to `FindFixApp.apply_fix`).
 from __future__ import annotations
 
 import os
+import asyncio
 from datetime import datetime, timezone
 
 from rich.console import Group
@@ -70,6 +71,8 @@ def _detail_renderable(a: AnalyzedMatch | None):
         )
     if m.matched_text:
         header.append(f"\nmatched: {m.matched_text[:120]}", style="dim")
+    if r.is_tracked:
+        header.append(f"\n⧉ tracked as work item #{r.work_item_id}", style="bold cyan")
 
     if r.verdict == Verdict.PENDING:
         return Panel(Group(header, Text("\nCopilot investigating…", style="yellow")), title="Details")
@@ -233,11 +236,11 @@ class ChatScreen(ModalScreen[None]):
 
     def on_mount(self) -> None:
         self.query_one("#ask", TextArea).focus()
-        self._render()
+        self._redraw()
         self.run_worker(self._connect(), exclusive=False)
 
     async def _connect(self) -> None:
-        self._render(connecting=True)
+        self._redraw(connecting=True)
         session = await self._source.chat_session(self._key)
         if session is None:
             self.query_one("#chat_log", Static).update(
@@ -246,15 +249,15 @@ class ChatScreen(ModalScreen[None]):
             return
         self._session = session
         session.on_update = self._on_update
-        self._render()
+        self._redraw()
         for msg in self._queued:
             self.run_worker(session.ask(msg), exclusive=False)
         self._queued.clear()
 
     def _on_update(self) -> None:
-        self.app.call_later(self._render)
+        self.app.call_later(self._redraw)
 
-    def _render(self, connecting: bool = False) -> None:
+    def _redraw(self, connecting: bool = False) -> None:
         log = self.query_one("#chat_log", Static)
         blocks: list = []
         transcript = self._session.transcript if self._session else []
@@ -292,7 +295,7 @@ class ChatScreen(ModalScreen[None]):
         ta.text = ""
         if self._session is None:
             self._queued.append(text)
-            self._render(connecting=True)
+            self._redraw(connecting=True)
             return
         self.run_worker(self._session.ask(text), exclusive=False)
 
@@ -345,6 +348,7 @@ class FindFixTUI(App):
         Binding("E", "reevaluate_all", "Re-eval tab"),
         Binding("r", "refresh", "Refresh"),
         Binding("o", "open_file", "Open file"),
+        Binding("w", "work_item", "Work item"),
         Binding("d", "discuss", "Discuss"),
         Binding("t", "change_theme", "Theme"),
         Binding("q", "quit", "Quit"),
@@ -455,6 +459,8 @@ class FindFixTUI(App):
                 note = f"{m.occurrence_count}× {note}".strip()
             if a.stale:
                 note = f"⟳ stale · {note}".strip(" ·")
+            if a.resolution.is_tracked:
+                note = f"⧉#{a.resolution.work_item_id} · {note}".strip(" ·")
             fix_cell = (
                 Text("diff", style="bold red") if a.resolution.has_fix
                 and a.verdict == Verdict.FIX
@@ -587,6 +593,40 @@ class FindFixTUI(App):
             self.notify(f"Apply failed: {msg}", severity="error", timeout=6)
         else:
             self.notify("Fix applied.", severity="information", timeout=3)
+
+    async def action_work_item(self) -> None:
+        sel = self._selected[self.active_index]
+        if not sel:
+            return
+        a = self.active.state.items.get(sel)
+        if a is None:
+            return
+        # Already tracked -> open it in the browser instead of re-filing.
+        if a.resolution.is_tracked:
+            url = a.resolution.work_item_url
+            if url:
+                import webbrowser
+                webbrowser.open(url)
+            self.notify(
+                f"Already tracked as #{a.resolution.work_item_id}.", timeout=3
+            )
+            return
+        if self.active.work.ado_tracking is None:
+            self.notify(
+                "ADO tracking not configured for this work unit "
+                "(add an 'ado_tracking' block to its config).",
+                severity="warning",
+                timeout=6,
+            )
+            return
+        self.notify("Filing work item…", timeout=3)
+        ok, msg = await asyncio.to_thread(self.active.create_work_item, sel)
+        self._refresh_ui()
+        self.notify(
+            f"Work item {msg}." if ok else f"Work item failed: {msg}",
+            severity="information" if ok else "error",
+            timeout=3 if ok else 8,
+        )
 
     def _switch_work(self, idx: int) -> None:
         idx = idx % len(self.apps)
