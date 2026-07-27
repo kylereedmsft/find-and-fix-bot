@@ -116,6 +116,35 @@ def _tracked_app(tmp_path) -> FindFixApp:
     return app
 
 
+def test_create_work_item_notifies_on_loop_thread_not_worker(tmp_path, monkeypatch):
+    """Regression: `_notify` (which drives the Textual UI) must never fire from
+    the worker thread that runs the blocking `az` call — mutating widgets
+    off-thread corrupts the DataTable (RowDoesNotExist on later render). The
+    blocking `ado.create_work_item` runs off the loop thread; every `_notify`
+    must run ON it."""
+    import threading
+
+    loop_thread = threading.get_ident()
+    az_threads: list[int] = []
+    notify_threads: list[int] = []
+
+    def fake_az(*a, **k):
+        az_threads.append(threading.get_ident())
+        return ado.WorkItemResult(ok=True, work_item_id=5, url="u", message="created #5")
+
+    monkeypatch.setattr(ado, "create_work_item", fake_az)
+    app = _tracked_app(tmp_path)
+    app.on_change(lambda: notify_threads.append(threading.get_ident()))
+    asyncio.run(app._scan_once())
+    key = next(iter(app.state.items))
+    notify_threads.clear()
+
+    asyncio.run(app.create_work_item(key))
+
+    assert az_threads and all(t != loop_thread for t in az_threads), "az call must run off-thread"
+    assert notify_threads and all(t == loop_thread for t in notify_threads), "notify must stay on the loop thread"
+
+
 def test_create_work_item_sets_and_persists_id(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ado, "create_work_item",
@@ -124,7 +153,7 @@ def test_create_work_item_sets_and_persists_id(tmp_path, monkeypatch):
     app = _tracked_app(tmp_path)
     asyncio.run(app._scan_once())
     key = next(iter(app.state.items))
-    ok, msg = app.create_work_item(key)
+    ok, msg = asyncio.run(app.create_work_item(key))
     assert ok and app.state.items[key].resolution.work_item_id == 99
 
     # survives a cache round-trip (fresh app hydrates the id from disk)
@@ -144,8 +173,8 @@ def test_create_work_item_idempotent_when_tracked(tmp_path, monkeypatch):
     app = _tracked_app(tmp_path)
     asyncio.run(app._scan_once())
     key = next(iter(app.state.items))
-    app.create_work_item(key)
-    ok, msg = app.create_work_item(key)  # second call must not re-file
+    asyncio.run(app.create_work_item(key))
+    ok, msg = asyncio.run(app.create_work_item(key))  # second call must not re-file
     assert ok and calls["n"] == 1 and "already tracked" in msg
 
 
@@ -161,5 +190,5 @@ def test_create_work_item_unconfigured(tmp_path):
     app._investigator.investigate = fake_investigate  # type: ignore[assignment]
     asyncio.run(app._scan_once())
     key = next(iter(app.state.items))
-    ok, msg = app.create_work_item(key)
+    ok, msg = asyncio.run(app.create_work_item(key))
     assert not ok and "not configured" in msg

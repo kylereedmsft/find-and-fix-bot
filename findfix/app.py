@@ -113,12 +113,17 @@ class FindFixApp:
 
     # ---- ADO work-item tracking -----------------------------------------
 
-    def create_work_item(self, key: str) -> tuple[bool, str]:
+    async def create_work_item(self, key: str) -> tuple[bool, str]:
         """File one ADO work item for the selected match's file.
 
         Idempotent: if the item already carries a `work_item_id` this is a
         no-op that just reports the existing id. Requires `ado_tracking` on the
         work unit. Returns (ok, message). On success the id/url are persisted.
+
+        Async on purpose: the only blocking part is the `az` subprocess, which
+        we offload with `asyncio.to_thread`. Everything that touches shared
+        state or calls `_notify` (and therefore the TUI) stays on the event
+        loop — mutating Textual widgets off-thread corrupts them.
         """
         a = self.state.items.get(key)
         if a is None:
@@ -136,7 +141,7 @@ class FindFixApp:
         description = ado.build_description(self.work.label, a)
         self._status(f"filing work item for {a.match.path}…")
         self._notify()
-        res = ado.create_work_item(tracking, title, description)
+        res = await asyncio.to_thread(ado.create_work_item, tracking, title, description)
         if res.ok and res.work_item_id is not None:
             a.resolution.work_item_id = res.work_item_id
             a.resolution.work_item_url = res.url

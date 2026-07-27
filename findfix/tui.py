@@ -12,7 +12,6 @@ directly (fix application is delegated to `FindFixApp.apply_fix`).
 from __future__ import annotations
 
 import os
-import asyncio
 from datetime import datetime, timezone
 
 from rich.console import Group
@@ -489,9 +488,12 @@ class FindFixTUI(App):
             )
             row_index[a.key] = idx
         self._row_index = row_index
+        # Keep the cursor on a VALID row. If the previously-selected key
+        # vanished (e.g. after a repo update changed the code), snap to row 0
+        # rather than leaving the cursor on a now-missing row.
         if sel and sel in row_index:
             table.move_cursor(row=row_index[sel])
-        elif table.row_count and sel is None:
+        elif table.row_count:
             table.move_cursor(row=0)
 
         s = self.active.state
@@ -632,7 +634,7 @@ class FindFixTUI(App):
             )
             return
         self.notify("Filing work item…", timeout=3)
-        ok, msg = await asyncio.to_thread(self.active.create_work_item, sel)
+        ok, msg = await self.active.create_work_item(sel)
         self._refresh_ui()
         self.notify(
             f"Work item {msg}." if ok else f"Work item failed: {msg}",
