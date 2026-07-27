@@ -242,13 +242,16 @@ class ChatScreen(ModalScreen[None]):
     async def _connect(self) -> None:
         self._redraw(connecting=True)
         session = await self._source.chat_session(self._key)
-        if not self.is_mounted:  # dismissed while connecting
-            return
         if session is None:
-            self.query_one("#chat_log", Static).update(
-                Text("(no session available for this match)", style="red")
-            )
+            try:
+                self.query_one("#chat_log", Static).update(
+                    Text("(no session available for this match)", style="red")
+                )
+            except NoMatches:  # screen dismissed while connecting
+                pass
             return
+        # Setting session state is safe even if the screen was dismissed; the
+        # session persists. Widget updates below self-guard against NoMatches.
         self._session = session
         session.on_update = self._on_update
         self._redraw()
@@ -257,15 +260,17 @@ class ChatScreen(ModalScreen[None]):
         self._queued.clear()
 
     def _on_update(self) -> None:
-        if self.is_mounted:
+        try:
             self.app.call_later(self._redraw)
+        except Exception:  # noqa: BLE001 — app gone / screen torn down
+            pass
 
     def _redraw(self, connecting: bool = False) -> None:
         # The screen may have been dismissed (Esc) while a background
         # `_connect`/`ask` was in flight, or an async session update may land
         # after close — in which case our widgets are gone. Bail out safely.
-        if not self.is_mounted:
-            return
+        # We key off NoMatches (widgets removed) rather than `is_mounted`, which
+        # can read False on a live modal and blank the whole chat.
         try:
             log = self.query_one("#chat_log", Static)
         except NoMatches:

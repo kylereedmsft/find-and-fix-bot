@@ -21,8 +21,10 @@ class _FakeSession:
         self.transcript = transcript
         self.pending = False
         self.on_update = None
+        self.asked = []
 
     async def ask(self, msg):
+        self.asked.append(msg)
         return None
 
     def copy_text(self):
@@ -108,4 +110,50 @@ def test_chatscreen_redraw_after_dismiss_is_safe():
 
     asyncio.run(main())
     assert not errors, f"redraw after dismiss raised: {errors}"
+
+
+class _SlowSource:
+    """chat_session resolves only after several event-loop ticks."""
+
+    def __init__(self, session):
+        self._session = session
+
+    async def chat_session(self, key):
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+        return self._session
+
+
+def test_chatscreen_submit_after_slow_connect():
+    """Regression: after a slow `_connect`, the screen must set `_session` and a
+    typed message pressed with Enter must reach `session.ask` (not get stuck in
+    `_queued` forever). Guards must key off widget presence, not `is_mounted`."""
+    from textual.widgets import TextArea
+
+    session = _FakeSession([])
+
+    class Base(App):
+        def compose(self) -> ComposeResult:
+            yield Static("base")
+
+        async def on_mount(self) -> None:
+            screen = ChatScreen(_SlowSource(session), "k", "Discuss — f.cs:1")
+            await self.push_screen(screen)
+            self._screen_ref = screen
+
+    async def main():
+        async with Base().run_test() as pilot:
+            await pilot.pause()
+            screen = pilot.app._screen_ref
+            # Wait for the slow connect to finish.
+            for _ in range(12):
+                await pilot.pause()
+            assert screen._session is not None, "connect never set the session"
+            screen.query_one("#ask", TextArea).text = "please fix it"
+            await pilot.press("enter")  # real binding path
+            for _ in range(4):
+                await pilot.pause()
+
+    asyncio.run(main())
+    assert session.asked == ["please fix it"], f"submit failed, asked={session.asked}"
 
