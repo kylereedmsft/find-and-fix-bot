@@ -73,3 +73,39 @@ def test_chatscreen_renders_with_transcript():
 def test_chatscreen_renders_no_session():
     # chat_session returns None -> "(no session available)" path must still render.
     _run_chatscreen(None)
+
+
+def test_chatscreen_redraw_after_dismiss_is_safe():
+    """Regression: an async session update (or a `_connect` finishing) after the
+    screen is dismissed must not crash with NoMatches on '#chat_log'. `_redraw`
+    and `_on_update` must no-op once the screen's widgets are gone."""
+    session = _FakeSession([("you", "hi")])
+    errors: list = []
+
+    class Base(App):
+        def compose(self) -> ComposeResult:
+            yield Static("base")
+
+        async def on_mount(self) -> None:
+            screen = ChatScreen(_FakeSource(session), "k", "Discuss — f.cs:1")
+            await self.push_screen(screen)
+            self._screen_ref = screen
+
+    async def main():
+        async with Base().run_test() as pilot:
+            await pilot.pause()
+            screen = pilot.app._screen_ref
+            pilot.app.pop_screen()  # dismiss
+            await pilot.pause()
+            # These fire from background workers/session callbacks post-close.
+            try:
+                screen._on_update()
+                screen._redraw()
+                screen._redraw(connecting=True)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+            await pilot.pause()
+
+    asyncio.run(main())
+    assert not errors, f"redraw after dismiss raised: {errors}"
+

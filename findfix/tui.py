@@ -23,6 +23,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -242,6 +243,8 @@ class ChatScreen(ModalScreen[None]):
     async def _connect(self) -> None:
         self._redraw(connecting=True)
         session = await self._source.chat_session(self._key)
+        if not self.is_mounted:  # dismissed while connecting
+            return
         if session is None:
             self.query_one("#chat_log", Static).update(
                 Text("(no session available for this match)", style="red")
@@ -255,10 +258,19 @@ class ChatScreen(ModalScreen[None]):
         self._queued.clear()
 
     def _on_update(self) -> None:
-        self.app.call_later(self._redraw)
+        if self.is_mounted:
+            self.app.call_later(self._redraw)
 
     def _redraw(self, connecting: bool = False) -> None:
-        log = self.query_one("#chat_log", Static)
+        # The screen may have been dismissed (Esc) while a background
+        # `_connect`/`ask` was in flight, or an async session update may land
+        # after close — in which case our widgets are gone. Bail out safely.
+        if not self.is_mounted:
+            return
+        try:
+            log = self.query_one("#chat_log", Static)
+        except NoMatches:
+            return
         blocks: list = []
         transcript = self._session.transcript if self._session else []
         for role, text in transcript:
