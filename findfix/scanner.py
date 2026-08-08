@@ -34,8 +34,14 @@ from pathlib import Path
 from .config import WorkConfig
 from .models import Match
 
-# Files above this size are skipped by the scanner (likely generated/binary).
+# Files above this size are skipped during the blind `os.walk` fallback
+# (likely generated/binary — we have no other signal there).
 _MAX_FILE_BYTES = 2_000_000
+# When `git grep` already confirmed a file is non-binary (`-I`) AND contains a
+# real textual match, the heuristic above no longer applies — skipping such a
+# file on size would silently drop genuine hits (e.g. a 2.6MB hand-written .cs).
+# We still keep a generous hard ceiling purely as OOM protection.
+_MAX_CONFIRMED_FILE_BYTES = 25_000_000
 # Hard cap on the focus span a refiner may return, in lines.
 _MAX_FOCUS_LINES = 160
 
@@ -170,6 +176,14 @@ def _git_candidate_files(work: WorkConfig) -> set[Path] | None:
 
 
 def _iter_files(work: WorkConfig):
+    """Yield ``(path, rel, confirmed)`` for each file to scan.
+
+    ``confirmed`` is True when the file came from the `git grep` fast path —
+    i.e. git already verified it is non-binary and contains a real textual
+    match — so the caller can skip the generated/binary size heuristic that
+    only makes sense on the blind ``os.walk`` fallback (where ``confirmed`` is
+    False).
+    """
     root = work.root_path
     if not root.exists():
         raise ScanError(f"scan root does not exist: {root}")
@@ -189,7 +203,7 @@ def _iter_files(work: WorkConfig):
                 continue
             if _matches_any(rel, excludes):
                 continue
-            yield p, rel
+            yield p, rel, True
         return
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune excluded directories in-place for speed.
@@ -210,12 +224,12 @@ def _iter_files(work: WorkConfig):
                 continue
             if _matches_any(rel, excludes):
                 continue
-            yield p, rel
+            yield p, rel, False
 
 
-def _read_text(p: Path) -> str | None:
+def _read_text(p: Path, max_bytes: int = _MAX_FILE_BYTES) -> str | None:
     try:
-        if p.stat().st_size > _MAX_FILE_BYTES:
+        if p.stat().st_size > max_bytes:
             return None
         return p.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -246,12 +260,15 @@ class Scanner:
         # to keep the overhead negligible. The primary path offloads to a
         # separate process (its own GIL), where this is simply a cheap no-op.
         next_yield = time.monotonic() + 0.02
-        for p, rel in _iter_files(self.work):
+        for p, rel, confirmed in _iter_files(self.work):
             now = time.monotonic()
             if now >= next_yield:
                 time.sleep(0)
                 next_yield = now + 0.02
-            text = _read_text(p)
+            # A git-confirmed candidate is known non-binary with a real match, so
+            # honor a much larger ceiling — don't drop a big hand-written file.
+            cap = _MAX_CONFIRMED_FILE_BYTES if confirmed else _MAX_FILE_BYTES
+            text = _read_text(p, cap)
             if text is None:
                 continue
             lines = text.splitlines()

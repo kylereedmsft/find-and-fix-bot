@@ -133,6 +133,25 @@ def test_git_fastpath_untracked_file(tmp_path):
     assert [m.path for m in Scanner(w).scan()] == ["fresh.cs"]
 
 
+def test_git_fastpath_scans_file_over_size_cap(tmp_path):
+    """A git-confirmed match in a file larger than the blind os.walk size cap
+    (`_MAX_FILE_BYTES`) must still be scanned — git already vetted it as
+    non-binary with a real hit, so the heuristic skip would drop a true match."""
+    import shutil
+    from findfix.scanner import _MAX_FILE_BYTES
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+    padding = ("// filler line to grow the file\n" * 80_000)  # ~2.5MB
+    body = padding + "if (SPFarm.IsSPO) {}\n"
+    big = tmp_path / "big.cs"
+    big.write_text(body, encoding="utf-8")
+    assert big.stat().st_size > _MAX_FILE_BYTES  # would be skipped by the blind path
+    _git(tmp_path, "init")
+    _git(tmp_path, "add", "-A")
+    w = WorkConfig(label="t", root=str(tmp_path), include=("**/*.cs",), regex=r"\bIsSPO\b")
+    assert [m.path for m in Scanner(w).scan()] == ["big.cs"]
+
+
 def test_line_window_refiner_span(tmp_path):
     body = "\n".join(f"line{i}" for i in range(1, 21)) + "\nTARGET\n"
     (tmp_path / "a.py").write_text(body, encoding="utf-8")
