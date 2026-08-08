@@ -20,8 +20,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json as _json
+import os
 import subprocess
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -32,7 +34,7 @@ from .chat import ChatSession, history_path
 from .config import WorkConfig
 from .investigator import Investigator
 from .models import AnalyzedMatch, AppState, Match, Resolution, Verdict
-from .scanner import ScanError, Scanner, group_by_file, _matches_any
+from .scanner import ScanError, Scanner, group_by_file, run_scan, _matches_any
 from .investigator import _resolution_from_item
 
 StateListener = Callable[[], None]
@@ -51,6 +53,14 @@ class FindFixApp:
         self._wake = asyncio.Event()
         self._force_discovery = False
         self._chats: dict[str, ChatSession] = {}
+        # Scan offload: the deterministic scan is CPU-bound (re.finditer +
+        # tree-sitter, both hold the GIL), so running it in a worker *thread*
+        # would still freeze the Textual UI. We instead offload it to a
+        # single-worker subprocess pool (its own interpreter/GIL). Created
+        # lazily on first scan; if spawn/pickle ever fails we fall back to a
+        # thread permanently for this instance.
+        self._scan_pool: ProcessPoolExecutor | None = None
+        self._scan_in_process = os.environ.get("FINDFIX_SCAN_IN_PROCESS", "1") != "0"
         # Warm-start from disk so relaunching shows prior resolutions instantly.
         self.state.items = self._cache.hydrate()
         self._drop_excluded()  # honor current excludes even for cached/applied items
@@ -86,8 +96,29 @@ class FindFixApp:
             self._force_discovery = True  # let a manual refresh re-run NL discovery
             self._wake.set()
 
+    async def restart(self) -> None:
+        """Clear this unit's results and re-run the find loop from scratch.
+
+        Wipes the in-memory items and the on-disk cache, then wakes the scan
+        loop so the next cycle re-scans and re-investigates every match fresh
+        (rather than serving cached resolutions). This is 'Re-eval tab' — a
+        light clear-and-restart, not a slow per-item LLM re-investigation.
+        """
+        if self.state.scanning:
+            return  # avoid racing a cycle that's mutating state.items
+        self.state.items = {}
+        self.state.error = None
+        self._cache.clear()
+        self._force_discovery = True  # NL units re-run discovery too
+        self._status("re-evaluating tab…")
+        self._notify()
+        self._wake.set()
+
     def stop(self) -> None:
         self._stop.set()
+        if self._scan_pool is not None:
+            self._scan_pool.shutdown(wait=False, cancel_futures=True)
+            self._scan_pool = None
 
     # ---- fix application -------------------------------------------------
 
@@ -254,10 +285,36 @@ class FindFixApp:
             self.state.scanning = False
             self._notify()
 
+    async def _run_scan(self) -> list[Match]:
+        """Run the deterministic scan without blocking the UI thread.
+
+        Primary path: a single-worker ``ProcessPoolExecutor`` — the scan runs
+        in a separate interpreter, so the parent's GIL stays free and the
+        Textual event loop keeps painting throughout. If the pool can't be
+        created or the call fails (spawn/pickle issue), we degrade permanently
+        to ``asyncio.to_thread`` (the scanner's cooperative ``time.sleep(0)``
+        yields keep the UI at least intermittently responsive there).
+        """
+        if self._scan_in_process:
+            try:
+                if self._scan_pool is None:
+                    self._scan_pool = ProcessPoolExecutor(max_workers=1)
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(self._scan_pool, run_scan, self.work)
+            except ScanError:
+                raise  # a real scan error (bad regex / missing root) — surface it
+            except Exception:
+                # One-time degrade: tear down the pool and never retry it.
+                self._scan_in_process = False
+                if self._scan_pool is not None:
+                    self._scan_pool.shutdown(wait=False, cancel_futures=True)
+                    self._scan_pool = None
+        return await asyncio.to_thread(self._scanner.scan)
+
     async def _regex_cycle(self) -> None:
         self._status(f"scanning {self.work.label}…")
         self._drop_excluded()  # a config edit may have added excludes since last cycle
-        matches = await asyncio.to_thread(self._scanner.scan)
+        matches = await self._run_scan()
         # Investigate each file once: collapse all hits in a file into a single
         # grouped match so we don't redundantly re-investigate (and re-fix) the
         # same file for every occurrence.

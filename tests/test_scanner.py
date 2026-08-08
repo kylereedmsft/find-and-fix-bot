@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from findfix.config import WorkConfig
-from findfix.scanner import ScanError, Scanner, group_by_file
+from findfix.scanner import ScanError, Scanner, group_by_file, run_scan
 
 
 def _work(tmp_path, **kw) -> WorkConfig:
@@ -53,6 +53,80 @@ def test_include_filter(tmp_path):
     (tmp_path / "a.txt").write_text("HIT\n", encoding="utf-8")
     w = WorkConfig(label="t", root=str(tmp_path), include=("**/*.py",), regex="HIT")
     assert [m.path for m in Scanner(w).scan()] == ["a.py"]
+
+
+def test_run_scan_matches_scanner(tmp_path):
+    """The module-level process-offload entry point yields the same results as
+    calling Scanner.scan() directly (verifies the picklable offload path)."""
+    (tmp_path / "a.py").write_text("x = 1\ny = TODO_HERE\nz = TODO_HERE\n", encoding="utf-8")
+    w = _work(tmp_path, regex=r"TODO_HERE")
+    direct = Scanner(w).scan()
+    offloaded = run_scan(w)
+    assert [(m.path, m.line, m.col, m.matched_text) for m in offloaded] == [
+        (m.path, m.line, m.col, m.matched_text) for m in direct
+    ]
+    assert len(offloaded) == 2
+
+
+# --- git-grep pre-filter ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern, expected",
+    [
+        (r"\bIsSPO\b", ["IsSPO"]),          # word-boundary literal
+        (r"except\s*:", ["except"]),         # trailing shorthand ignored
+        (r"colou?r", ["colo"]),              # optional last char trimmed
+        (r"abc\ddef", ["abc", "def"]),       # shorthand class splits, both required
+        (r"[A-Za-z]+IsSPO", ["IsSPO"]),      # char class neutralized
+        (r"#\s*(TODO|FIXME)\b", None),       # top-level alternation -> unsafe
+        (r"\d+", None),                       # no literal -> unsafe
+        (r"ab", None),                        # too short -> nothing to grep
+    ],
+)
+def test_prefilter_terms(pattern, expected):
+    from findfix.scanner import _prefilter_terms
+    assert _prefilter_terms(pattern) == expected
+
+
+def _git(tmp_path, *args):
+    import subprocess
+    subprocess.run(["git", "-C", str(tmp_path), *args], capture_output=True, check=True)
+
+
+def test_git_fastpath_narrows_and_matches(tmp_path):
+    """On a real git tree the fast path must find every true match and skip files
+    that only the pre-filter literal would flag (Python regex stays authoritative)."""
+    import shutil
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+    (tmp_path / "hit.cs").write_text("if (SPFarm.IsSPO) {}\n", encoding="utf-8")
+    (tmp_path / "sibling.cs").write_text("var x = IsSPODvNext;\n", encoding="utf-8")  # substring, not \bIsSPO\b
+    (tmp_path / "none.cs").write_text("var y = 1;\n", encoding="utf-8")
+    _git(tmp_path, "init")
+    _git(tmp_path, "add", "-A")
+
+    w = WorkConfig(label="t", root=str(tmp_path), include=("**/*.cs",), regex=r"\bIsSPO\b")
+    from findfix.scanner import _git_candidate_files
+    cands = _git_candidate_files(w)
+    assert cands is not None  # git tree + safe literal -> fast path engaged
+    names = {p.name for p in cands}
+    assert "hit.cs" in names and "sibling.cs" in names  # both contain substring "IsSPO"
+    assert "none.cs" not in names                       # pre-filter correctly skips it
+
+    # Authoritative scan: only the real \bIsSPO\b match survives.
+    assert [m.path for m in Scanner(w).scan()] == ["hit.cs"]
+
+
+def test_git_fastpath_untracked_file(tmp_path):
+    """An untracked (not-yet-committed) .cs file must still be scanned."""
+    import shutil
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+    _git(tmp_path, "init")
+    (tmp_path / "fresh.cs").write_text("if (SPFarm.IsSPO) {}\n", encoding="utf-8")  # never added
+    w = WorkConfig(label="t", root=str(tmp_path), include=("**/*.cs",), regex=r"\bIsSPO\b")
+    assert [m.path for m in Scanner(w).scan()] == ["fresh.cs"]
 
 
 def test_line_window_refiner_span(tmp_path):

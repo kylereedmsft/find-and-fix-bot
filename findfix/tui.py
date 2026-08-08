@@ -28,6 +28,7 @@ from textual.widgets import (
     Button,
     DataTable,
     Footer,
+    Input,
     OptionList,
     Static,
     Tab,
@@ -343,6 +344,15 @@ class ChatScreen(ModalScreen[None]):
         self.dismiss()
 
 
+class FilterInput(Input):
+    """Path filter box. Escape clears the filter and returns to the table."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    def action_cancel(self) -> None:
+        self.app.action_clear_filter()
+
+
 class FindFixTUI(App):
     CSS = """
     HeaderBar { height: 1; dock: top; background: $panel; }
@@ -352,6 +362,8 @@ class FindFixTUI(App):
     TabStatus { width: 1fr; height: 2; content-align: right middle; }
     #body { height: 1fr; }
     #matches { height: 1fr; border: round $primary; }
+    #filter { display: none; height: 3; border: round $accent; }
+    #filter.visible { display: block; }
     #detail_scroll { height: 4fr; border: round $secondary; }
     DataTable { height: 1fr; }
     """
@@ -366,6 +378,7 @@ class FindFixTUI(App):
         Binding("o", "open_file", "Open file"),
         Binding("w", "work_item", "Work item"),
         Binding("d", "discuss", "Discuss"),
+        Binding("slash", "filter", "Filter"),
         Binding("t", "change_theme", "Theme"),
         Binding("q", "quit", "Quit"),
     ]
@@ -375,6 +388,7 @@ class FindFixTUI(App):
         self.apps = apps
         self.active_index = 0
         self._selected: dict[int, str | None] = {i: None for i in range(len(apps))}
+        self._filter: dict[int, str] = {i: "" for i in range(len(apps))}
         self._spin = 0
         self._row_index: dict[str, int] = {}
         self._status_col = None
@@ -410,6 +424,7 @@ class FindFixTUI(App):
             yield tabs
             yield TabStatus(self)
         with Vertical(id="body"):
+            yield FilterInput(placeholder="Filter by path… (Enter to keep · Esc to clear)", id="filter")
             yield DataTable(id="matches", cursor_type="row", zebra_stripes=True)
             with VerticalScroll(id="detail_scroll", can_focus=False):
                 yield Static(_detail_renderable(None), id="detail")
@@ -463,12 +478,17 @@ class FindFixTUI(App):
 
     # ---- data -> table ---------------------------------------------------
 
-    def _refresh_ui(self) -> None:
+    def _refresh_ui(self, preserve_row: int | None = None) -> None:
         table = self.query_one("#matches", DataTable)
         sel = self._selected[self.active_index]
+        s = self.active.state
+        flt = (self._filter.get(self.active_index) or "").strip().lower()
+        rows = s.ordered()
+        if flt:
+            rows = [a for a in rows if flt in a.match.path.lower()]
         table.clear()
         row_index: dict[str, int] = {}
-        for idx, a in enumerate(self.active.state.ordered()):
+        for idx, a in enumerate(rows):
             m = a.match
             note = m.matched_text or m.reason or ""
             if m.occurrence_count > 1:
@@ -493,15 +513,20 @@ class FindFixTUI(App):
             )
             row_index[a.key] = idx
         self._row_index = row_index
-        # Keep the cursor on a VALID row. If the previously-selected key
-        # vanished (e.g. after a repo update changed the code), snap to row 0
-        # rather than leaving the cursor on a now-missing row.
-        if sel and sel in row_index:
+        # Cursor placement. `preserve_row` keeps the cursor at the same LIST
+        # POSITION (used after applying a fix, so re-sorting doesn't drag the
+        # cursor along with the item that just moved — you stay put and can keep
+        # working down the list). Otherwise we follow the previously-selected
+        # key, snapping to row 0 only if it vanished (e.g. a repo update).
+        if preserve_row is not None and table.row_count:
+            r = max(0, min(preserve_row, table.row_count - 1))
+            table.move_cursor(row=r)
+            self._selected[self.active_index] = rows[r].key
+        elif sel and sel in row_index:
             table.move_cursor(row=row_index[sel])
         elif table.row_count:
             table.move_cursor(row=0)
 
-        s = self.active.state
         first_load = not s.items and s.last_refresh is None and s.error is None
         was_loading = table.loading
         table.loading = first_load
@@ -512,6 +537,11 @@ class FindFixTUI(App):
             table.border_title = f" {self.active.work.label} — scanning… "
         elif not s.items:
             table.border_title = f" {self.active.work.label} — no matches "
+        elif flt:
+            table.border_title = (
+                f" {self.active.work.label} — {table.row_count}/{len(s.items)} "
+                f"match(es) · filter: {flt!r} "
+            )
         else:
             table.border_title = f" {self.active.work.label} — {table.row_count} match(es) "
 
@@ -541,7 +571,13 @@ class FindFixTUI(App):
             a = ordered[0] if ordered else None
             if a:
                 self._selected[self.active_index] = a.key
-        self.query_one("#detail", Static).update(_detail_renderable(a))
+        # Row-highlight events can be delivered while the table is mid-rebuild
+        # (or during teardown), moments when the detail pane isn't queryable.
+        # A detail refresh is best-effort — never crash the app over it.
+        try:
+            self.query_one("#detail", Static).update(_detail_renderable(a))
+        except NoMatches:
+            pass
 
     # ---- events ----------------------------------------------------------
 
@@ -580,10 +616,17 @@ class FindFixTUI(App):
         title = f"Discuss — {a.match.path}:{a.match.line}  [{self.active.work.label}]"
         self.push_screen(ChatScreen(self.active, sel, title))
 
-    async def action_reevaluate(self) -> None:
+    def action_reevaluate(self) -> None:
         sel = self._selected[self.active_index]
         if not sel:
             return
+        # Run in a worker, not inline: an action handler that awaits a slow
+        # (up to 600s) LLM investigation would block Textual's message pump and
+        # freeze the whole UI until it returns. Offloading to a worker keeps the
+        # event loop free to process input and paint progress.
+        self.run_worker(self._reevaluate_one(sel), group="reeval", exclusive=True)
+
+    async def _reevaluate_one(self, sel: str) -> None:
         ok, msg = await self.active.reevaluate(sel)
         self._refresh_ui()
         self.notify(
@@ -592,22 +635,24 @@ class FindFixTUI(App):
             timeout=3 if ok else 6,
         )
 
-    async def action_reevaluate_all(self) -> None:
-        keys = list(self.active.state.items)
-        if not keys:
-            return
-        self.notify(f"Re-evaluating {len(keys)} item(s)…", timeout=3)
-        for key in keys:
-            await self.active.reevaluate(key)
-        self._refresh_ui()
-        self.notify("Re-evaluation complete.", timeout=3)
+    def action_reevaluate_all(self) -> None:
+        # "Re-eval tab" = clear this tab's results and let the main find loop
+        # re-run from scratch (scan → investigate), rather than a slow serial
+        # per-item LLM pass. restart() only clears state + wakes the loop, so
+        # the actual scan/investigate work happens off the UI thread.
+        self.notify("Re-evaluating tab…", timeout=3)
+        self.run_worker(self.active.restart(), group="reeval", exclusive=True)
 
     def action_apply_fix(self) -> None:
         sel = self._selected[self.active_index]
         if not sel:
             return
+        table = self.query_one("#matches", DataTable)
+        row = table.cursor_row
         ok, msg = self.active.apply_fix(sel)
-        self._refresh_ui()
+        # Keep the cursor where it is in the list rather than following the
+        # just-applied item to its new sorted position.
+        self._refresh_ui(preserve_row=row)
         if not ok:
             self.notify(f"Apply failed: {msg}", severity="error", timeout=6)
         else:
@@ -653,6 +698,10 @@ class FindFixTUI(App):
             return
         self.active_index = idx
         try:
+            self.query_one("#filter", FilterInput).remove_class("visible")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             self.query_one("#works", Tabs).active = f"work-{idx}"
         except Exception:  # noqa: BLE001
             pass
@@ -680,6 +729,32 @@ class FindFixTUI(App):
 
     def action_change_theme(self) -> None:
         self.push_screen(ThemePicker())
+
+    # ---- path filter -----------------------------------------------------
+
+    def action_filter(self) -> None:
+        inp = self.query_one("#filter", FilterInput)
+        inp.value = self._filter.get(self.active_index, "")
+        inp.add_class("visible")
+        inp.focus()
+
+    def action_clear_filter(self) -> None:
+        inp = self.query_one("#filter", FilterInput)
+        inp.value = ""
+        self._filter[self.active_index] = ""
+        inp.remove_class("visible")
+        self._refresh_ui()
+        self.query_one("#matches", DataTable).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "filter":
+            self._filter[self.active_index] = event.value
+            self._refresh_ui()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "filter":
+            event.input.remove_class("visible")
+            self.query_one("#matches", DataTable).focus()
 
     async def action_quit(self) -> None:
         for a in self.apps:

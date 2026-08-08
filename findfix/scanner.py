@@ -26,6 +26,8 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import subprocess
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -76,12 +78,106 @@ def _compile(work: WorkConfig) -> re.Pattern:
         raise ScanError(f"invalid regex for '{work.label}': {e}") from e
 
 
+def _prefilter_terms(pattern: str) -> list[str] | None:
+    """Extract literal substrings that MUST appear in every match of `pattern`.
+
+    Used to pre-narrow a huge tree with `git grep -F` before the authoritative
+    Python-regex scan reads any file. Correctness rule: the returned terms are a
+    *superset filter* — every string the regex matches is guaranteed to contain
+    all of them — so a file lacking a term cannot contain a match and is safe to
+    skip. When we can't guarantee that (alternation, groups, lookaround, no long
+    literal), we return None and the caller falls back to a full walk.
+    """
+    if not pattern:
+        return None
+    # Alternation or groups can make any given literal optional -> not safe.
+    # Neutralize character classes first so a `|`/`(` inside `[...]` doesn't trip us.
+    stripped_classes = re.sub(r"\[[^\]]*\]", " ", pattern)
+    if any(c in stripped_classes for c in ("|", "(")):
+        return None
+    # Drop escaped pairs (\d, \b, \s, \.) so shorthand classes don't masquerade
+    # as literals; replace with a separator so runs on either side don't merge.
+    neutral = re.sub(r"\\.", " ", stripped_classes)
+    neutral = re.sub(r"\[[^\]]*\]", " ", neutral)
+    terms: list[str] = []
+    for mo in re.finditer(r"[A-Za-z0-9_]+", neutral):
+        s = mo.group(0)
+        nxt = neutral[mo.end()] if mo.end() < len(neutral) else ""
+        # A trailing optional/variable quantifier makes the last char uncertain;
+        # trim it (always safe — yields a shorter, still-required substring).
+        if nxt in ("?", "*", "{"):
+            s = s[:-1]
+        if len(s) >= 3:
+            terms.append(s)
+    return terms or None
+
+
+def _git_candidate_files(work: WorkConfig) -> set[Path] | None:
+    """Return the set of files under the work root that could contain a match,
+    using `git grep` as a fast pre-filter, or None if the fast path can't be
+    used safely (not a git tree, git missing, or no safe literal to grep for).
+
+    This keeps the Python regex authoritative (the caller still scans each
+    returned file) while avoiding reading every file in a massive repo — the
+    difference between reading ~hundreds vs. ~tens-of-thousands of files.
+    """
+    terms = _prefilter_terms(work.regex or "")
+    if not terms:
+        return None
+    root = work.root_path
+    try:
+        chk = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if chk.returncode != 0 or chk.stdout.strip() != "true":
+            return None
+        args = ["git", "-C", str(root), "grep", "--no-color", "-I", "-l", "-F", "--untracked"]
+        if "IGNORECASE" in work.regex_flags:
+            args.append("-i")
+        if len(terms) > 1:
+            args.append("--all-match")  # file must contain ALL required literals
+        for t in terms:
+            args += ["-e", t]
+        args += ["--", "."]
+        res = subprocess.run(args, cwd=str(root), capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode > 1:  # 0 = matches, 1 = no matches, >1 = error
+        return None
+    out: set[Path] = set()
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        p = root / line
+        if p.exists():
+            out.add(p.resolve())
+    return out
+
+
 def _iter_files(work: WorkConfig):
     root = work.root_path
     if not root.exists():
         raise ScanError(f"scan root does not exist: {root}")
     includes = work.include
     excludes = work.all_excludes
+    # Fast path: on a git tree, let `git grep` narrow to candidate files first so
+    # we don't read the entire repo in Python (which holds the GIL and freezes
+    # the UI during a scan on large repos).
+    candidates = _git_candidate_files(work)
+    if candidates is not None:
+        for p in sorted(candidates):
+            try:
+                rel = p.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if not _matches_any(rel, includes):
+                continue
+            if _matches_any(rel, excludes):
+                continue
+            yield p, rel
+        return
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune excluded directories in-place for speed.
         rel_dir = Path(dirpath).relative_to(root).as_posix()
@@ -131,7 +227,17 @@ class Scanner:
         if self._pattern is None:
             return []  # description-only: discovery happens in the AI layer
         out: list[Match] = []
+        # Cooperative yield: when this runs in a worker *thread* (the fallback
+        # path), a bare `time.sleep(0)` releases the GIL at a bytecode boundary
+        # so Textual's event loop can paint a frame. Time-gated (~every 20ms)
+        # to keep the overhead negligible. The primary path offloads to a
+        # separate process (its own GIL), where this is simply a cheap no-op.
+        next_yield = time.monotonic() + 0.02
         for p, rel in _iter_files(self.work):
+            now = time.monotonic()
+            if now >= next_yield:
+                time.sleep(0)
+                next_yield = now + 0.02
             text = _read_text(p)
             if text is None:
                 continue
@@ -159,6 +265,19 @@ class Scanner:
                 if len(out) >= self.work.max_matches:
                     return out
         return out
+
+
+def run_scan(work: WorkConfig) -> list[Match]:
+    """Module-level, picklable scan entry point for process offload.
+
+    ``app.py`` runs this in a ``ProcessPoolExecutor`` so the CPU-bound scan
+    (``re.finditer`` + tree-sitter parsing, both single C calls that hold the
+    GIL) executes in a *separate interpreter*. That frees the parent's GIL
+    entirely, keeping the Textual UI responsive during a scan. ``WorkConfig``
+    and ``Match`` are both picklable, so the call and its result cross the
+    process boundary cleanly.
+    """
+    return Scanner(work).scan()
 
 
 def group_by_file(matches: list[Match]) -> list[Match]:
@@ -257,9 +376,18 @@ def _treesitter_refiner(work: WorkConfig):
         "declaration", "block", "statement", "clause",
     )
 
+    # Parse each file once per scan, not once per hit: the scanner passes the
+    # same `text` object for every match in a file, so cache by identity.
+    _cache: dict = {"text_id": None, "tree": None}
+
     def refine(text: str, lines: list[str], hit_line: int):
         try:
-            tree = parser.parse(text.encode("utf-8", "replace"))
+            if _cache["text_id"] == id(text) and _cache["tree"] is not None:
+                tree = _cache["tree"]
+            else:
+                tree = parser.parse(text.encode("utf-8", "replace"))
+                _cache["text_id"] = id(text)
+                _cache["tree"] = tree
             # byte offset of the start of the hit line
             off = sum(len(l.encode("utf-8", "replace")) + 1 for l in lines[: hit_line - 1])
             node = tree.root_node.descendant_for_byte_range(off, off)

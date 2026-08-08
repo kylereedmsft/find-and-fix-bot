@@ -124,6 +124,13 @@ class ResolutionCache:
         if self._data.pop(key, None) is not None:
             self._save()
 
+    def clear(self) -> None:
+        """Drop every entry for this work unit so the next scan re-investigates
+        all matches from scratch (used by 'Re-eval tab')."""
+        if self._data:
+            self._data = {}
+            self._save()
+
     def prune(self, live_keys: set[str]) -> None:
         before = len(self._data)
         self._data = {k: v for k, v in self._data.items() if k in live_keys}

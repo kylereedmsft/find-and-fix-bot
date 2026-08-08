@@ -38,7 +38,17 @@ Cheap and broad first, expensive and precise last:
 
 1. **Text search / regex** (`scanner.py`) — walk the files a unit selects,
    apply its regex. No LLM, no network. This *narrows* the repo to candidate
-   sites fast.
+   sites fast. On a git work tree the scanner first uses `git grep` to
+   pre-filter to just the files that could match (extracting a safe required
+   literal from the regex), so a huge repo is never fully read in Python — it
+   falls back to a full filesystem walk when there's no git tree or no safe
+   literal to grep for (e.g. an alternation like `(TODO|FIXME)`). The scan
+   runs in a **separate process** (`ProcessPoolExecutor`), so its CPU-bound
+   work (`re`/tree-sitter, which hold the GIL) can't freeze the TUI — the UI
+   thread keeps the parent interpreter's GIL to itself and stays responsive
+   throughout. If spawning fails it degrades to a worker thread (whose
+   cooperative `time.sleep(0)` yields keep the UI at least intermittently
+   painting); set `FINDFIX_SCAN_IN_PROCESS=0` to force the thread path.
 2. **Structural refine** (optional) — turn each hit's line into a focused
    source span so the model sees a self-contained unit:
    * `line-window` — ±N lines (always available),
@@ -161,9 +171,14 @@ py -3.12 -m venv .venv
 ```
 
 **Keys:** `←`/`→` switch unit · `↑`/`↓` select match · `SPACE` pause/resume ·
-`a` apply the selected fix · `e` re-evaluate the selected match (`E` = whole
-tab) · `d` discuss the selected match · `r` refresh (re-runs NL discovery) · `o`
-open the file · `t` theme · `q` quit.
+`a` apply the selected fix · `e` re-evaluate the selected match (`E` = clear the
+tab & re-run the find loop) · `d` discuss the selected match · `r` refresh (re-runs NL discovery) · `o`
+open the file · `/` filter rows by path (Enter keeps it · Esc clears) · `t`
+theme · `q` quit.
+
+Applying a fix (`a`) keeps the cursor at the same **position** in the list
+rather than following the just-fixed row to its new sorted slot, so you can work
+straight down a tab without losing your place.
 
 ## Discuss & refine a fix (`d`)
 
@@ -253,9 +268,12 @@ matched file and, if it changed since the resolution, flags the item **`⟳ stal
   the key intact — the resolution would otherwise be served stale, so it's
   flagged instead.
 
-Press **`e`** to force a fresh investigation of the selected match (or **`E`** for
-the whole tab). Re-evaluation ignores the cache, re-runs with the currently
-loaded `context`, and works even while analysis is paused. Note: to pick up an
+Press **`e`** to force a fresh investigation of the selected match. It ignores
+the cache, re-runs with the currently loaded `context`, works even while
+analysis is paused, and runs in a background worker so the UI stays responsive
+during the (possibly slow) LLM call. Press **`E`** ("Re-eval tab") to clear the
+tab's results and cache and let the main find loop start over — the next cycle
+re-scans and re-investigates every match from scratch. Note: to pick up an
 edited `context` from the JSON you still relaunch (it changes `scope_key`, which
 re-runs the whole unit) — `e`/`E` re-run against the context loaded in the
 current session.

@@ -80,6 +80,23 @@ def test_scan_seeds_and_investigates(tmp_path):
     assert items[0].verdict == Verdict.FIX
 
 
+def test_scan_via_process_pool(tmp_path):
+    """The production offload path: run the scan in a subprocess pool and
+    verify matches come back and the pool is cleaned up by stop()."""
+    res = Resolution(verdict=Verdict.FIX, explanation="e", diff="d")
+    app = _make_app(tmp_path, res)
+    app._scan_in_process = True  # opt in despite the suite-wide thread default
+    try:
+        asyncio.run(app._scan_once())
+        assert app._scan_pool is not None  # pool was created and used
+        items = list(app.state.items.values())
+        assert len(items) == 1
+        assert items[0].verdict == Verdict.FIX
+    finally:
+        app.stop()
+        assert app._scan_pool is None  # stop() tore the pool down
+
+
 def test_apply_fix_writes_and_marks_applied(tmp_path):
     diff = (
         "--- a/s.py\n+++ b/s.py\n@@ -2,4 +2,4 @@ def f():\n"
@@ -172,6 +189,39 @@ def test_reevaluate_runs_even_when_paused(tmp_path):
     app._investigator.investigate = stub  # type: ignore[assignment]
     ok, _ = asyncio.run(app.reevaluate(key))
     assert ok and called["n"] == 1  # explicit action ignores pause
+
+
+def test_restart_clears_items_and_cache_and_wakes(tmp_path):
+    """'Re-eval tab' wipes the tab's results + cache and wakes the find loop so
+    the next cycle re-scans and re-investigates from scratch."""
+    app = _make_app(tmp_path, Resolution(verdict=Verdict.FIX, explanation="e", diff="d"))
+    asyncio.run(app._scan_once())
+    assert app.state.items                 # seeded
+    assert app._cache.hydrate()            # and cached to disk
+
+    app._wake.clear()
+    asyncio.run(app.restart())
+    assert app.state.items == {}           # in-memory results cleared
+    assert app._cache.hydrate() == {}      # persisted cache wiped
+    assert app._wake.is_set()              # loop woken to re-scan
+    assert app._force_discovery is True
+
+    # A fresh scan re-seeds and re-investigates the same match from scratch.
+    asyncio.run(app._scan_once())
+    assert len(app.state.items) == 1
+    assert next(iter(app.state.items.values())).verdict == Verdict.FIX
+
+
+def test_restart_skips_while_scanning(tmp_path):
+    """restart() must not clear state mid-scan (it would race the cycle that's
+    mutating state.items)."""
+    app = _make_app(tmp_path, Resolution(verdict=Verdict.FIX, explanation="e", diff="d"))
+    asyncio.run(app._scan_once())
+    app.state.scanning = True
+    app._wake.clear()
+    asyncio.run(app.restart())
+    assert app.state.items          # untouched
+    assert not app._wake.is_set()   # no-op
 
 
 def test_file_change_outside_focus_marks_stale(tmp_path):
