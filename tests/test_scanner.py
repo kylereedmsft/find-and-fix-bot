@@ -75,11 +75,15 @@ def test_run_scan_matches_scanner(tmp_path):
     "pattern, expected",
     [
         (r"\bIsSPO\b", ["IsSPO"]),          # word-boundary literal
+        (r"\bIsSPO(?:Get)?\b", ["IsSPO"]),  # optional group dropped, prefix kept
+        (r"foo(bar)?baz", ["foo", "baz"]),   # optional group dropped, literals kept
+        (r"pre(?:a(?:b)?)?post", ["pre", "post"]),  # nested groups peeled
         (r"except\s*:", ["except"]),         # trailing shorthand ignored
         (r"colou?r", ["colo"]),              # optional last char trimmed
         (r"abc\ddef", ["abc", "def"]),       # shorthand class splits, both required
         (r"[A-Za-z]+IsSPO", ["IsSPO"]),      # char class neutralized
-        (r"#\s*(TODO|FIXME)\b", None),       # top-level alternation -> unsafe
+        (r"#\s*(TODO|FIXME)\b", None),       # alternation content dropped -> no literal
+        (r"foo|bar", None),                  # top-level alternation -> unsafe
         (r"\d+", None),                       # no literal -> unsafe
         (r"ab", None),                        # too short -> nothing to grep
     ],

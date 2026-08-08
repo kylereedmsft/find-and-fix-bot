@@ -85,24 +85,37 @@ def _prefilter_terms(pattern: str) -> list[str] | None:
     Python-regex scan reads any file. Correctness rule: the returned terms are a
     *superset filter* — every string the regex matches is guaranteed to contain
     all of them — so a file lacking a term cannot contain a match and is safe to
-    skip. When we can't guarantee that (alternation, groups, lookaround, no long
-    literal), we return None and the caller falls back to a full walk.
+    skip. When we can't guarantee that (top-level alternation, lookaround, no
+    long literal), we return None and the caller falls back to a full walk.
     """
     if not pattern:
         return None
-    # Alternation or groups can make any given literal optional -> not safe.
-    # Neutralize character classes first so a `|`/`(` inside `[...]` doesn't trip us.
-    stripped_classes = re.sub(r"\[[^\]]*\]", " ", pattern)
-    if any(c in stripped_classes for c in ("|", "(")):
+    # Neutralize character classes first so a `|`/`(`/`)` inside `[...]` can't
+    # trip the structural checks below.
+    stripped = re.sub(r"\[[^\]]*\]", " ", pattern)
+    # Drop escaped pairs (\d, \b, \s, \., \(, \)) so shorthand classes and
+    # escaped metacharacters don't masquerade as literals or as real groups.
+    # Replace with a separator so runs on either side don't merge.
+    stripped = re.sub(r"\\.", " ", stripped)
+    stripped = re.sub(r"\[[^\]]*\]", " ", stripped)
+    # Remove parenthesized groups (with any trailing quantifier). Nothing inside
+    # an optional or alternated group is individually guaranteed; even a required
+    # single-literal group only *adds* a term. So dropping groups can make the
+    # filter less selective but never incorrect — it lets us still extract the
+    # guaranteed literals *outside* a group (e.g. `IsSPO` in `IsSPO(?:Get|Set)?`).
+    # Iterate to peel nested groups from the inside out.
+    prev = None
+    while prev != stripped:
+        prev = stripped
+        stripped = re.sub(r"\([^()]*\)(?:[?*+]|\{\d+(?:,\d*)?\})?", " ", stripped)
+    # Leftover parens (unbalanced) or a top-level `|` (unguarded alternation)
+    # mean we can't guarantee a required literal -> fall back to a full walk.
+    if any(c in stripped for c in ("(", ")", "|")):
         return None
-    # Drop escaped pairs (\d, \b, \s, \.) so shorthand classes don't masquerade
-    # as literals; replace with a separator so runs on either side don't merge.
-    neutral = re.sub(r"\\.", " ", stripped_classes)
-    neutral = re.sub(r"\[[^\]]*\]", " ", neutral)
     terms: list[str] = []
-    for mo in re.finditer(r"[A-Za-z0-9_]+", neutral):
+    for mo in re.finditer(r"[A-Za-z0-9_]+", stripped):
         s = mo.group(0)
-        nxt = neutral[mo.end()] if mo.end() < len(neutral) else ""
+        nxt = stripped[mo.end()] if mo.end() < len(stripped) else ""
         # A trailing optional/variable quantifier makes the last char uncertain;
         # trim it (always safe — yields a shorter, still-required substring).
         if nxt in ("?", "*", "{"):
